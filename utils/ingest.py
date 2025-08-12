@@ -1,12 +1,12 @@
 # utils/ingest.py
-import os, json, requests, hashlib
+import os, json, requests, hashlib, math, time
 from urllib.parse import urlsplit, urlunsplit, parse_qsl, urlencode
 from dotenv import load_dotenv
 from pymongo import MongoClient
 
 load_dotenv()
 
-BACKEND_URL = os.getenv("BACKEND_URL", "http://127.0.0.1:8000")
+BACKEND_URL = os.getenv("BACKEND_URL", "http://127.0.0.1:8000").rstrip("/")
 MODE        = os.getenv("INGEST_MODE", "http").lower()  # "http" or "mongo"
 
 MONGO_URI   = os.getenv("MONGO_URI", "")
@@ -14,6 +14,10 @@ MONGO_DB    = os.getenv("MONGO_DB", "influAI")
 MONGO_COL   = os.getenv("MONGO_COL", "scraped_data")
 
 OUTBOX      = os.getenv("OUTBOX_PATH", "data/outbox.jsonl")
+
+# batching + timeout
+INGEST_BATCH_SIZE   = max(1, int(os.getenv("INGEST_BATCH_SIZE", "20")))
+INGEST_HTTP_TIMEOUT = int(os.getenv("INGEST_HTTP_TIMEOUT", "120"))
 
 # optional notifier; safe fallback if notify.py isn't present
 try:
@@ -23,43 +27,24 @@ except Exception:
         pass
 
 # ----- Canonicalization (match backend logic) -----
-# Keep lowercase for case-insensitive comparisons
 TRACKING_PARAMS = {
     "utm_source","utm_medium","utm_campaign","utm_term","utm_content",
     "gclid","fbclid","mc_cid","mc_eid","ref","ref_src","igshid"
 }
 
 def canonicalize_url(u: str) -> str:
-    """
-    Normalize URL for dedupe:
-      - lowercase host, drop leading 'www.'
-      - remove known tracking params (case-insensitive)
-      - sort remaining query pairs for stability
-      - drop fragments
-      - normalize path (remove trailing slash except root)
-    """
     try:
         parts = urlsplit((u or "").strip())
         host = (parts.hostname or "").lower()
         if host.startswith("www."):
             host = host[4:]
-
-        # drop tracking params (case-insensitive) and sort
-        q_pairs = parse_qsl(parts.query, keep_blank_values=True)
-        q_pairs = [(k, v) for (k, v) in q_pairs if k.lower() not in TRACKING_PARAMS]
-        q_pairs.sort(key=lambda kv: (kv[0].lower(), kv[1]))
-
-        # normalize path
+        q = [(k, v) for (k, v) in parse_qsl(parts.query, keep_blank_values=True)
+             if k.lower() not in TRACKING_PARAMS]
+        q.sort(key=lambda kv: (kv[0].lower(), kv[1]))
         path = parts.path or "/"
         if path != "/" and path.endswith("/"):
             path = path.rstrip("/")
-
-        new = parts._replace(
-            netloc=host,
-            path=path,
-            query=urlencode(q_pairs, doseq=True),
-            fragment=""
-        )
+        new = parts._replace(netloc=host, path=path, query=urlencode(q, doseq=True), fragment="")
         return urlunsplit(new)
     except Exception:
         return (u or "").strip()
@@ -78,32 +63,65 @@ def _ensure_outbox_dir():
 
 def _write_outbox(items):
     _ensure_outbox_dir()
+    with open(OUTBOX, "a", encoding="utf-8") as f:
+        for it in items:
+            f.write(json.dumps(it, ensure_ascii=False) + "\n")
+
+# ----- HTTP helpers -----
+def _warm_up_backend():
+    if not BACKEND_URL:
+        return
     try:
-        with open(OUTBOX, "a", encoding="utf-8") as f:
-            for it in items:
-                f.write(json.dumps(it, ensure_ascii=False) + "\n")
+        requests.get(f"{BACKEND_URL}/health", timeout=8)
     except Exception:
-        # last-resort: swallow file I/O errors to avoid crashing the caller
+        # best-effort only
         pass
 
-def _augment_for_dedupe(item: dict) -> dict:
-    """Attach url_canon and content_hash for better dedupe downstream."""
-    url = (item.get("url") or "").strip()
-    if url:
-        item["url_canon"] = canonicalize_url(url)
-    h = content_hash(item.get("content", ""))
-    if h:
-        item["content_hash"] = h
-    return item
+def _post_batches(items):
+    """POST /ingest in small batches with retries."""
+    _warm_up_backend()
+    total = len(items)
+    if total == 0:
+        return {"ok": True, "upserts": 0}
+
+    upserts_total = 0
+    skipped_total = 0
+    sess = requests.Session()
+
+    for i in range(0, total, INGEST_BATCH_SIZE):
+        batch = items[i:i+INGEST_BATCH_SIZE]
+        # retry up to 2 times on network failures
+        last_err = None
+        for attempt in range(2):
+            try:
+                r = sess.post(
+                    f"{BACKEND_URL}/ingest",
+                    json=batch,
+                    timeout=INGEST_HTTP_TIMEOUT,
+                )
+                r.raise_for_status()
+                resp = r.json()
+                upserts_total += int(resp.get("upserts", 0))
+                skipped_total += int(resp.get("skipped", 0))
+                break
+            except Exception as e:
+                last_err = e
+                if attempt == 0:
+                    time.sleep(2)
+        else:
+            # both attempts failed -> outbox remaining batches and alert
+            remaining = items[i:]
+            _write_outbox(remaining)
+            alert(f"🧺 Outbox queued {len(remaining)} docs (HTTP ingest failed). Error: {last_err}")
+            return {"ok": False, "queued": len(remaining), "outbox": OUTBOX, "error": str(last_err)}
+
+    return {"ok": True, "upserts": upserts_total, "skipped": skipped_total}
 
 # ----- Public API -----
 def ingest_items(items):
     """Try to ingest; on failure, queue to outbox and alert."""
     if not items:
         return {"ok": True, "upserts": 0, "mode": MODE}
-
-    # augment all items with canonical fields to help either backend or mongo mode
-    items = [_augment_for_dedupe(dict(r)) for r in items]
 
     try:
         if MODE == "mongo":
@@ -113,37 +131,40 @@ def ingest_items(items):
             upserts = 0
             for r in items:
                 url = (r.get("url") or "").strip()
-                url_canon = (r.get("url_canon") or "").strip()
-                r.setdefault("title", ""); r.setdefault("content", "")
-                r.setdefault("topic", ""); r.setdefault("source", "")
+                url_canon = canonicalize_url(url) if url else ""
+                r.setdefault("title",""); r.setdefault("content","")
+                r.setdefault("topic",""); r.setdefault("source","")
+                r["url"] = url
+                r["url_canon"] = url_canon
+                h = content_hash(r.get("content", ""))
+                if h:
+                    r["content_hash"] = h
 
-                # choose best key: url_canon, then content_hash, then raw url
-                key = None
                 if url_canon:
-                    key = {"url_canon": url_canon}
+                    col.update_one(
+                        {"url_canon": url_canon},
+                        {"$set": r, "$setOnInsert": {"created_at": True}},
+                        upsert=True
+                    )
+                elif h:
+                    col.update_one(
+                        {"content_hash": h},
+                        {"$set": r, "$setOnInsert": {"created_at": True}},
+                        upsert=True
+                    )
                 else:
-                    h = r.get("content_hash")
-                    if h:
-                        key = {"content_hash": h}
-                    elif url:
-                        key = {"url": url}
-
-                if not key:
-                    # nothing to upsert by; skip
-                    continue
-
-                col.update_one(
-                    key,
-                    {"$set": r, "$setOnInsert": {"created_at": True}},
-                    upsert=True
-                )
+                    if not url:
+                        continue
+                    col.update_one(
+                        {"url": url},
+                        {"$set": r, "$setOnInsert": {"created_at": True}},
+                        upsert=True
+                    )
                 upserts += 1
             return {"ok": True, "upserts": upserts, "mode": "mongo"}
 
-        # default: HTTP to backend
-        r = requests.post(f"{BACKEND_URL}/ingest", json=items, timeout=60)
-        r.raise_for_status()
-        return r.json()
+        # default: HTTP (batched)
+        return _post_batches(items)
 
     except Exception as e:
         _write_outbox(items)
