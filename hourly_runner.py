@@ -27,6 +27,8 @@ ENABLE_YOUTUBE = os.getenv("ENABLE_YOUTUBE", "false").lower() == "true"
 REDDIT_PER_SUB = int(os.getenv("REDDIT_PER_SUB", "8"))
 PAUSE_BETWEEN_QUERIES = float(os.getenv("DELAY_BETWEEN_REQUESTS", "1.0"))
 MAX_TOTAL_DOCS = max(1, int(os.getenv("MAX_TOTAL_DOCS", "500")))  # safety cap
+INGEST_BATCH_SIZE = max(1, int(os.getenv("INGEST_BATCH_SIZE", "50")))
+
 
 # Run strategy:
 #  - "all": run all enabled sources every time
@@ -145,21 +147,22 @@ def main():
 
     # 5) Ingest (with a quick retry; utils.ingest will outbox on failure anyway)
     ok = True
-    try:
-        res = ingest_items(all_docs)
-        ok = isinstance(res, dict) and bool(res.get("ok", True))
-    except Exception as e:
-        print(f"[warn] ingest failed once: {e}; retrying in 3s …")
-        time.sleep(3)
-        try:
-            res = ingest_items(all_docs)
-            ok = isinstance(res, dict) and bool(res.get("ok", True))
-        except Exception as e2:
-            print(f"[error] ingest retry failed: {e2}")
-            ok = False
-            res = {"ok": False, "error": str(e2)}
+    all_responses = []
+    batches = [all_docs[i:i+INGEST_BATCH_SIZE] for i in range(0, len(all_docs), INGEST_BATCH_SIZE)]
 
-    print("Ingest:", json.dumps(res, indent=2))
+    for bi, batch in enumerate(batches, 1):
+        try:
+            res = ingest_items(batch)
+            all_responses.append(res)
+            b_ok = isinstance(res, dict) and bool(res.get("ok", True))
+            ok = ok and b_ok
+            print(f"[ingest] batch {bi}/{len(batches)} -> {res}")
+            time.sleep(1)  # tiny pause between batches
+        except Exception as e:
+            print(f"[error] ingest batch {bi} failed: {e}")
+            ok = False
+
+    print("Ingest (summary):", json.dumps(all_responses, indent=2))
 
     # Alert summary (success or queued)
     try:

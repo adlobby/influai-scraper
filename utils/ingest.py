@@ -14,6 +14,8 @@ MONGO_DB    = os.getenv("MONGO_DB", "influAI")
 MONGO_COL   = os.getenv("MONGO_COL", "scraped_data")
 
 OUTBOX      = os.getenv("OUTBOX_PATH", "data/outbox.jsonl")
+INGEST_HTTP_TIMEOUT = int(os.getenv("INGEST_HTTP_TIMEOUT", "60"))
+
 
 # batching + timeout
 INGEST_BATCH_SIZE   = max(1, int(os.getenv("INGEST_BATCH_SIZE", "20")))
@@ -94,11 +96,7 @@ def _post_batches(items):
         last_err = None
         for attempt in range(2):
             try:
-                r = sess.post(
-                    f"{BACKEND_URL}/ingest",
-                    json=batch,
-                    timeout=INGEST_HTTP_TIMEOUT,
-                )
+                r = requests.post(f"{BACKEND_URL}/ingest", json=items, timeout=INGEST_HTTP_TIMEOUT)
                 r.raise_for_status()
                 resp = r.json()
                 upserts_total += int(resp.get("upserts", 0))
