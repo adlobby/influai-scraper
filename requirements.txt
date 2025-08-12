@@ -1,0 +1,13 @@
+requests
+python-dotenv
+feedparser
+pymongo[srv]>=4.6
+dnspython>=2.4
+beautifulsoup4
+pytrends
+trafilatura
+google-api-python-client
+youtube-transcript-api
+praw
+newsapi-python
+pdfminer.six
