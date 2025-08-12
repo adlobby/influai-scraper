@@ -1,0 +1,146 @@
+name: scraper-hourly
+
+on:
+  workflow_dispatch: {}
+  schedule:
+    - cron: "7 * * * *"
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    concurrency:
+      group: scraper-hourly
+      cancel-in-progress: true
+
+    env:
+      # Flags / toggles
+      ENABLE_TRENDS:        ${{ vars.ENABLE_TRENDS || 'true' }}
+      ENABLE_NEWSAPI:       ${{ vars.ENABLE_NEWSAPI || 'false' }}
+      ENABLE_REDDIT_API:    ${{ vars.ENABLE_REDDIT_API || 'true' }}
+      ENABLE_YOUTUBE:       ${{ vars.ENABLE_YOUTUBE || 'false' }}
+      RUN_STRATEGY:         ${{ vars.RUN_STRATEGY || 'rotate' }}
+
+      # Limits
+      MAX_RESULTS_PER_QUERY: ${{ vars.MAX_RESULTS_PER_QUERY || 8 }}
+      MAX_QUERIES_PER_HOUR:  ${{ vars.MAX_QUERIES_PER_HOUR || 12 }}
+      MAX_TOTAL_DOCS:        ${{ vars.MAX_TOTAL_DOCS || 500 }}
+      REDDIT_PER_SUB:        ${{ vars.REDDIT_PER_SUB || 8 }}
+
+      # Keywords
+      SCRAPE_KEYWORDS: ${{ vars.SCRAPE_KEYWORDS || 'ai marketing, creator economy, social media trends' }}
+
+      # Backend / monitoring
+      BACKEND_URL:   ${{ secrets.BACKEND_URL }}
+      ALERT_WEBHOOK: ${{ secrets.ALERT_WEBHOOK }}
+
+      # APIs
+      GOOGLE_API_KEY:        ${{ secrets.GOOGLE_API_KEY }}
+      GOOGLE_CSE_ID:         ${{ secrets.GOOGLE_CSE_ID }}
+      NEWSAPI_KEY:           ${{ secrets.NEWSAPI_KEY }}
+      REDDIT_CLIENT_ID:      ${{ secrets.REDDIT_CLIENT_ID }}
+      REDDIT_CLIENT_SECRET:  ${{ secrets.REDDIT_CLIENT_SECRET }}
+      REDDIT_USER_AGENT:     ${{ vars.REDDIT_USER_AGENT }}
+      YOUTUBE_API_KEY:       ${{ secrets.YOUTUBE_API_KEY }}
+
+      # (only if you ever switch to direct mongo mode)
+      MONGO_URI: ${{ secrets.MONGO_URI }}
+
+      # Misc
+      OUTBOX_PATH: data/outbox.jsonl
+      MIN_CONTENT_LEN: "150"
+      HTTP_TIMEOUT_SEC: "20"
+      DELAY_BETWEEN_REQUESTS: "1.0"
+      PDF_MAX_BYTES: "8388608"
+      PDF_MAX_PAGES: "15"
+
+      # NEW: batched ingest tuning
+      INGEST_BATCH_SIZE:   ${{ vars.INGEST_BATCH_SIZE || 20 }}
+      INGEST_HTTP_TIMEOUT: ${{ vars.INGEST_HTTP_TIMEOUT || 120 }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: |
+          python -V
+          pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Warm up backend
+        if: env.BACKEND_URL != ''
+        run: |
+          for i in {1..6}; do
+            echo "ping $BACKEND_URL/health ($i/6)"
+            if curl -fsS --max-time 10 "$BACKEND_URL/health" | grep -q '"ok":'; then
+              echo "backend is up"; exit 0; fi
+            sleep 5
+          done
+          echo "backend didn't respond; continuing anyway"
+
+      - name: Write .env from env/secret context (with safe defaults)
+        shell: bash
+        run: |
+          RU="${REDDIT_USER_AGENT:-python:adlobby-scraper:v1.0 (by /u/Good_Mycologist9190)}"
+
+          cat > .env <<EOF
+          BACKEND_URL=${BACKEND_URL}
+          INGEST_MODE=http
+
+          ENABLE_TRENDS=${ENABLE_TRENDS}
+          ENABLE_NEWSAPI=${ENABLE_NEWSAPI}
+          ENABLE_REDDIT_API=${ENABLE_REDDIT_API}
+          ENABLE_YOUTUBE=${ENABLE_YOUTUBE}
+
+          RUN_STRATEGY=${RUN_STRATEGY}
+          MAX_TOTAL_DOCS=${MAX_TOTAL_DOCS}
+          REDDIT_PER_SUB=${REDDIT_PER_SUB}
+
+          SCRAPE_KEYWORDS="${SCRAPE_KEYWORDS}"
+          MAX_RESULTS_PER_QUERY=${MAX_RESULTS_PER_QUERY}
+          MAX_QUERIES_PER_HOUR=${MAX_QUERIES_PER_HOUR}
+          DELAY_BETWEEN_REQUESTS=${DELAY_BETWEEN_REQUESTS}
+          MIN_CONTENT_LEN=${MIN_CONTENT_LEN}
+          HTTP_TIMEOUT_SEC=${HTTP_TIMEOUT_SEC}
+
+          GOOGLE_API_KEY=${GOOGLE_API_KEY}
+          GOOGLE_CSE_ID=${GOOGLE_CSE_ID}
+
+          NEWSAPI_KEY=${NEWSAPI_KEY}
+
+          REDDIT_CLIENT_ID=${REDDIT_CLIENT_ID}
+          REDDIT_CLIENT_SECRET=${REDDIT_CLIENT_SECRET}
+          REDDIT_USER_AGENT=${RU}
+
+          YOUTUBE_API_KEY=${YOUTUBE_API_KEY}
+
+          OUTBOX_PATH=${OUTBOX_PATH}
+          ALERT_WEBHOOK=${ALERT_WEBHOOK}
+
+          PDF_MAX_BYTES=${PDF_MAX_BYTES}
+          PDF_MAX_PAGES=${PDF_MAX_PAGES}
+
+          # ingest tuning
+          INGEST_BATCH_SIZE=${INGEST_BATCH_SIZE}
+          INGEST_HTTP_TIMEOUT=${INGEST_HTTP_TIMEOUT}
+          EOF
+
+          echo "Wrote .env:"
+          sed 's/^\(.*KEY\)=.*/\1=***hidden***/; s/\(SECRET\|PASSWORD\)=.*/\1=***hidden***/' .env
+
+      - name: Run scraper
+        run: python hourly_runner.py
+
+      - name: Upload outbox (if any)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: outbox
+          path: data/outbox.jsonl
+          if-no-files-found: ignore
