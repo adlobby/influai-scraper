@@ -73,12 +73,7 @@ def clean(s: str) -> str:
 def google_cse(query: str):
     if not API_KEY or not CSE_ID:
         raise RuntimeError("Set GOOGLE_API_KEY and GOOGLE_CSE_ID in .env")
-    params = {
-        "key": API_KEY,
-        "cx": CSE_ID,
-        "q": query,
-        "num": min(10, MAX_PER),
-    }
+    params = {"key": API_KEY, "cx": CSE_ID, "q": query, "num": min(10, MAX_PER)}
     url = "https://www.googleapis.com/customsearch/v1?" + urlencode(params)
     r = SESSION.get(url, timeout=TIMEOUT)
     r.raise_for_status()
@@ -99,15 +94,21 @@ def extract_text(html_str: str, url: str | None = None) -> str:
     # Fallback to trafilatura if available and BS4 was too short
     if len(text) < MIN_LEN and trafilatura:
         try:
-            tx = trafilatura.extract(
-                html_str, url=url, include_tables=False, include_comments=False
-            )
+            tx = trafilatura.extract(html_str, url=url, include_tables=False, include_comments=False)
             if tx and len(tx) > len(text):
                 text = tx
         except Exception:
             pass
 
     return text[:8000]
+
+def fetch(url: str) -> str:
+    """HTML fetch with retry + random UA + robust decoding (kept for extra_sources compatibility)."""
+    headers = {"User-Agent": random.choice(UA_POOL)}
+    r = SESSION.get(url, headers=headers, timeout=TIMEOUT)
+    r.raise_for_status()
+    dammit = UnicodeDammit(r.content)
+    return dammit.unicode_markup or r.text
 
 def extract_from_url(url: str) -> tuple[str, bool]:
     """
@@ -116,32 +117,32 @@ def extract_from_url(url: str) -> tuple[str, bool]:
     Falls back to HTML extraction for non-PDF.
     """
     headers = {"User-Agent": random.choice(UA_POOL)}
-    # Stream to inspect headers and optionally cap PDF size
     r = SESSION.get(url, headers=headers, timeout=TIMEOUT, stream=True)
-    ct = (r.headers.get("content-type") or "").lower()
-    looks_pdf = ("application/pdf" in ct) or url.lower().endswith(".pdf")
+    try:
+        r.raise_for_status()
+        ct = (r.headers.get("content-type") or "").lower()
+        looks_pdf = ("application/pdf" in ct) or url.lower().endswith(".pdf")
 
-    if looks_pdf:
-        if pdf_extract_text is None:
-            r.close()
-            raise RuntimeError("PDF detected but pdfminer.six not installed")
-        data = b""
-        for chunk in r.iter_content(chunk_size=8192):
-            if not chunk:
-                break
-            data += chunk
-            if len(data) > PDF_MAX_BYTES:
-                r.close()
-                raise RuntimeError("PDF too large; exceeded PDF_MAX_BYTES cap")
+        if looks_pdf:
+            if pdf_extract_text is None:
+                raise RuntimeError("PDF detected but pdfminer.six not installed")
+            data = b""
+            for chunk in r.iter_content(chunk_size=8192):
+                if not chunk:
+                    break
+                data += chunk
+                if len(data) > PDF_MAX_BYTES:
+                    raise RuntimeError("PDF too large; exceeded PDF_MAX_BYTES cap")
+            try:
+                text = pdf_extract_text(BytesIO(data), maxpages=PDF_MAX_PAGES) or ""
+            except Exception:
+                text = ""
+            return clean(text)[:8000], True
+    finally:
+        # ensure stream response is closed in all branches
         r.close()
-        try:
-            text = pdf_extract_text(BytesIO(data), maxpages=PDF_MAX_PAGES) or ""
-        except Exception:
-            text = ""
-        return clean(text)[:8000], True
 
     # Not PDF → do a regular fetch for robust HTML decoding
-    r.close()
     r = SESSION.get(url, headers=headers, timeout=TIMEOUT)
     r.raise_for_status()
     dammit = UnicodeDammit(r.content)
@@ -149,7 +150,12 @@ def extract_from_url(url: str) -> tuple[str, bool]:
     text = extract_text(html_src, url=url)
     return text, False
 
-def run_for_keyword(kw: str):
+def run_for_keyword(kw: str, skip_url=None, mark_seen=None):
+    """
+    Scrape results for a keyword.
+    - skip_url(url)->bool : if provided, skip before fetch (per-topic seen).
+    - mark_seen(url)      : if provided, mark after a doc is accepted.
+    """
     docs = []
     logging.info(f"Searching: {kw}")
     try:
@@ -163,6 +169,12 @@ def run_for_keyword(kw: str):
             if not link:
                 continue
             host = urlparse(link).netloc.lower().replace("www.", "")
+
+            # per-topic prefetch skip
+            if callable(skip_url) and skip_url(link):
+                logging.info(f"Skip seen (topic={kw}): {link}")
+                continue
+
             if host in DOMAIN_BLOCKLIST:
                 logging.info(f"Skip blocked host: {host}")
                 continue
@@ -182,6 +194,9 @@ def run_for_keyword(kw: str):
                 "snippet": clean(snippet),
                 "source_type": "pdf" if is_pdf else "web",
             })
+
+            if callable(mark_seen):
+                mark_seen(link)
 
             time.sleep(DELAY_S)
             if len(docs) >= MAX_PER:

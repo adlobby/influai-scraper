@@ -23,20 +23,43 @@ except Exception:
         pass
 
 # ----- Canonicalization (match backend logic) -----
+# Keep lowercase for case-insensitive comparisons
 TRACKING_PARAMS = {
     "utm_source","utm_medium","utm_campaign","utm_term","utm_content",
     "gclid","fbclid","mc_cid","mc_eid","ref","ref_src","igshid"
 }
 
 def canonicalize_url(u: str) -> str:
+    """
+    Normalize URL for dedupe:
+      - lowercase host, drop leading 'www.'
+      - remove known tracking params (case-insensitive)
+      - sort remaining query pairs for stability
+      - drop fragments
+      - normalize path (remove trailing slash except root)
+    """
     try:
         parts = urlsplit((u or "").strip())
         host = (parts.hostname or "").lower()
         if host.startswith("www."):
             host = host[4:]
-        q = [(k, v) for k, v in parse_qsl(parts.query, keep_blank_values=True)
-             if k not in TRACKING_PARAMS]
-        new = parts._replace(netloc=host, query=urlencode(q, doseq=True), fragment="")
+
+        # drop tracking params (case-insensitive) and sort
+        q_pairs = parse_qsl(parts.query, keep_blank_values=True)
+        q_pairs = [(k, v) for (k, v) in q_pairs if k.lower() not in TRACKING_PARAMS]
+        q_pairs.sort(key=lambda kv: (kv[0].lower(), kv[1]))
+
+        # normalize path
+        path = parts.path or "/"
+        if path != "/" and path.endswith("/"):
+            path = path.rstrip("/")
+
+        new = parts._replace(
+            netloc=host,
+            path=path,
+            query=urlencode(q_pairs, doseq=True),
+            fragment=""
+        )
         return urlunsplit(new)
     except Exception:
         return (u or "").strip()
@@ -55,15 +78,32 @@ def _ensure_outbox_dir():
 
 def _write_outbox(items):
     _ensure_outbox_dir()
-    with open(OUTBOX, "a", encoding="utf-8") as f:
-        for it in items:
-            f.write(json.dumps(it, ensure_ascii=False) + "\n")
+    try:
+        with open(OUTBOX, "a", encoding="utf-8") as f:
+            for it in items:
+                f.write(json.dumps(it, ensure_ascii=False) + "\n")
+    except Exception:
+        # last-resort: swallow file I/O errors to avoid crashing the caller
+        pass
+
+def _augment_for_dedupe(item: dict) -> dict:
+    """Attach url_canon and content_hash for better dedupe downstream."""
+    url = (item.get("url") or "").strip()
+    if url:
+        item["url_canon"] = canonicalize_url(url)
+    h = content_hash(item.get("content", ""))
+    if h:
+        item["content_hash"] = h
+    return item
 
 # ----- Public API -----
 def ingest_items(items):
     """Try to ingest; on failure, queue to outbox and alert."""
     if not items:
         return {"ok": True, "upserts": 0, "mode": MODE}
+
+    # augment all items with canonical fields to help either backend or mongo mode
+    items = [_augment_for_dedupe(dict(r)) for r in items]
 
     try:
         if MODE == "mongo":
@@ -73,37 +113,30 @@ def ingest_items(items):
             upserts = 0
             for r in items:
                 url = (r.get("url") or "").strip()
-                url_canon = canonicalize_url(url) if url else ""
+                url_canon = (r.get("url_canon") or "").strip()
                 r.setdefault("title", ""); r.setdefault("content", "")
                 r.setdefault("topic", ""); r.setdefault("source", "")
-                # mirror backend dedupe keys
-                r["url"] = url
-                r["url_canon"] = url_canon
-                h = content_hash(r.get("content", ""))
-                if h:
-                    r["content_hash"] = h
 
+                # choose best key: url_canon, then content_hash, then raw url
+                key = None
                 if url_canon:
-                    col.update_one(
-                        {"url_canon": url_canon},
-                        {"$set": r, "$setOnInsert": {"created_at": True}},
-                        upsert=True
-                    )
-                elif h:
-                    col.update_one(
-                        {"content_hash": h},
-                        {"$set": r, "$setOnInsert": {"created_at": True}},
-                        upsert=True
-                    )
+                    key = {"url_canon": url_canon}
                 else:
-                    # last-resort key: raw url (or skip if missing)
-                    if not url:
-                        continue
-                    col.update_one(
-                        {"url": url},
-                        {"$set": r, "$setOnInsert": {"created_at": True}},
-                        upsert=True
-                    )
+                    h = r.get("content_hash")
+                    if h:
+                        key = {"content_hash": h}
+                    elif url:
+                        key = {"url": url}
+
+                if not key:
+                    # nothing to upsert by; skip
+                    continue
+
+                col.update_one(
+                    key,
+                    {"$set": r, "$setOnInsert": {"created_at": True}},
+                    upsert=True
+                )
                 upserts += 1
             return {"ok": True, "upserts": upserts, "mode": "mongo"}
 
