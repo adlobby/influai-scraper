@@ -1,0 +1,198 @@
+name: scraper-deep
+
+on:
+  workflow_dispatch:
+    inputs:
+      keywords:
+        description: 'Override keywords (comma separated). Leave blank to use repo VAR "SCRAPE_KEYWORDS".'
+        required: false
+        type: string
+      run_strategy:
+        description: 'Run strategy'
+        required: true
+        default: all
+        type: choice
+        options: [all, rotate]
+      enable_youtube:
+        description: 'Include YouTube transcripts'
+        required: true
+        default: true
+        type: boolean
+      enable_newsapi:
+        description: 'Include NewsAPI'
+        required: true
+        default: true
+        type: boolean
+      enable_reddit:
+        description: 'Include Reddit API'
+        required: true
+        default: true
+        type: boolean
+      max_queries:
+        description: 'MAX_QUERIES_PER_HOUR'
+        required: true
+        default: 20
+        type: number
+      max_results_per_query:
+        description: 'MAX_RESULTS_PER_QUERY'
+        required: true
+        default: 12
+        type: number
+      max_total_docs:
+        description: 'MAX_TOTAL_DOCS'
+        required: true
+        default: 800
+        type: number
+      reddit_per_sub:
+        description: 'REDDIT_PER_SUB'
+        required: true
+        default: 12
+        type: number
+      ingest_batch_size:
+        description: 'INGEST_BATCH_SIZE'
+        required: true
+        default: 30
+        type: number
+      ingest_http_timeout:
+        description: 'INGEST_HTTP_TIMEOUT (seconds)'
+        required: true
+        default: 180
+        type: number
+
+jobs:
+  deep-research:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    concurrency:
+      group: scraper-deep
+      cancel-in-progress: true
+
+    env:
+      # Toggles (default to inputs or sensible deep-research defaults)
+      ENABLE_TRENDS:           ${{ vars.ENABLE_TRENDS || 'true' }}
+      ENABLE_NEWSAPI:          ${{ github.event.inputs.enable_newsapi && 'true' || 'false' }}
+      ENABLE_REDDIT_API:       ${{ github.event.inputs.enable_reddit && 'true' || 'false' }}
+      ENABLE_YOUTUBE:          ${{ github.event.inputs.enable_youtube && 'true' || 'false' }}
+      RUN_STRATEGY:            ${{ github.event.inputs.run_strategy || 'all' }}
+
+      # Limits
+      MAX_RESULTS_PER_QUERY:   ${{ github.event.inputs.max_results_per_query || 12 }}
+      MAX_QUERIES_PER_HOUR:    ${{ github.event.inputs.max_queries || 20 }}
+      MAX_TOTAL_DOCS:          ${{ github.event.inputs.max_total_docs || 800 }}
+      REDDIT_PER_SUB:          ${{ github.event.inputs.reddit_per_sub || 12 }}
+
+      # Keywords (override > repo VAR > fallback)
+      SCRAPE_KEYWORDS:         ${{ github.event.inputs.keywords || vars.SCRAPE_KEYWORDS || 'ai marketing, creator economy, social media trends' }}
+
+      # Backend / monitoring
+      BACKEND_URL:             ${{ secrets.BACKEND_URL }}
+      ALERT_WEBHOOK:           ${{ secrets.ALERT_WEBHOOK }}
+
+      # APIs (must be set in repo/environment secrets)
+      GOOGLE_API_KEY:          ${{ secrets.GOOGLE_API_KEY }}
+      GOOGLE_CSE_ID:           ${{ secrets.GOOGLE_CSE_ID }}
+      NEWSAPI_KEY:             ${{ secrets.NEWSAPI_KEY }}
+      REDDIT_CLIENT_ID:        ${{ secrets.REDDIT_CLIENT_ID }}
+      REDDIT_CLIENT_SECRET:    ${{ secrets.REDDIT_CLIENT_SECRET }}
+      REDDIT_USER_AGENT:       ${{ vars.REDDIT_USER_AGENT }}
+      YOUTUBE_API_KEY:         ${{ secrets.YOUTUBE_API_KEY }}
+
+      # Optional direct-mongo (unused when BACKEND_URL is set)
+      MONGO_URI:               ${{ secrets.MONGO_URI }}
+
+      # Misc scraper knobs
+      OUTBOX_PATH:             data/outbox.jsonl
+      MIN_CONTENT_LEN:         "150"
+      HTTP_TIMEOUT_SEC:        "20"
+      DELAY_BETWEEN_REQUESTS:  "1.0"
+      PDF_MAX_BYTES:           "8388608"   # 8MB
+      PDF_MAX_PAGES:           "15"
+
+      # Ingest tuning (bigger for deep runs)
+      INGEST_BATCH_SIZE:       ${{ github.event.inputs.ingest_batch_size || 30 }}
+      INGEST_HTTP_TIMEOUT:     ${{ github.event.inputs.ingest_http_timeout || 180 }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: |
+          python -V
+          pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Warm up backend
+        if: env.BACKEND_URL != ''
+        run: |
+          for i in {1..8}; do
+            echo "ping $BACKEND_URL/health ($i/8)"
+            if curl -fsS --max-time 10 "$BACKEND_URL/health" | grep -q '"ok":'; then
+              echo "backend is up"; exit 0; fi
+            sleep 5
+          done
+          echo "backend didn't respond; continuing anyway"
+
+      - name: Write .env for this run
+        shell: bash
+        run: |
+          RU="${REDDIT_USER_AGENT:-python:adlobby-scraper:v1.0 (by /u/Good_Mycologist9190)}"
+          cat > .env <<EOF
+          BACKEND_URL=${BACKEND_URL}
+          INGEST_MODE=http
+
+          ENABLE_TRENDS=${ENABLE_TRENDS}
+          ENABLE_NEWSAPI=${ENABLE_NEWSAPI}
+          ENABLE_REDDIT_API=${ENABLE_REDDIT_API}
+          ENABLE_YOUTUBE=${ENABLE_YOUTUBE}
+
+          RUN_STRATEGY=${RUN_STRATEGY}
+          MAX_TOTAL_DOCS=${MAX_TOTAL_DOCS}
+          REDDIT_PER_SUB=${REDDIT_PER_SUB}
+
+          SCRAPE_KEYWORDS="${SCRAPE_KEYWORDS}"
+          MAX_RESULTS_PER_QUERY=${MAX_RESULTS_PER_QUERY}
+          MAX_QUERIES_PER_HOUR=${MAX_QUERIES_PER_HOUR}
+          DELAY_BETWEEN_REQUESTS=${DELAY_BETWEEN_REQUESTS}
+          MIN_CONTENT_LEN=${MIN_CONTENT_LEN}
+          HTTP_TIMEOUT_SEC=${HTTP_TIMEOUT_SEC}
+
+          GOOGLE_API_KEY=${GOOGLE_API_KEY}
+          GOOGLE_CSE_ID=${GOOGLE_CSE_ID}
+          NEWSAPI_KEY=${NEWSAPI_KEY}
+
+          REDDIT_CLIENT_ID=${REDDIT_CLIENT_ID}
+          REDDIT_CLIENT_SECRET=${REDDIT_CLIENT_SECRET}
+          REDDIT_USER_AGENT=${RU}
+
+          YOUTUBE_API_KEY=${YOUTUBE_API_KEY}
+
+          OUTBOX_PATH=${OUTBOX_PATH}
+          ALERT_WEBHOOK=${ALERT_WEBHOOK}
+
+          PDF_MAX_BYTES=${PDF_MAX_BYTES}
+          PDF_MAX_PAGES=${PDF_MAX_PAGES}
+
+          # ingest tuning
+          INGEST_BATCH_SIZE=${INGEST_BATCH_SIZE}
+          INGEST_HTTP_TIMEOUT=${INGEST_HTTP_TIMEOUT}
+          EOF
+
+          echo "Wrote .env:"
+          sed 's/^\(.*KEY\)=.*/\1=***hidden***/; s/\(SECRET\|PASSWORD\)=.*/\1=***hidden***/' .env
+
+      - name: Run deep research
+        run: python hourly_runner.py
+
+      - name: Upload outbox (if any)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: outbox
+          path: data/outbox.jsonl
+          if-no-files-found: ignore
